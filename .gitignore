@@ -1,0 +1,25 @@
+# Python build/runtime artefacts for the AWS video pipeline.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+.venv/
+venv/
+
+# Generated edge bundle is INTENTIONALLY tracked (CI rebuilds + publishes it),
+# so do NOT ignore edge/bunny/deploy/entry.js.
+
+# Never commit local secrets or Terraform state/vars.
+.env
+.env.*
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfvars
+
+# CI generates this during the gated packer build (job `packer`).
+packer-manifest.json
