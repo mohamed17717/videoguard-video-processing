@@ -1,0 +1,3 @@
+[submodule "forensic-wm"]
+	path = forensic-wm
+	url = https://github.com/mohamed17717/videoguard-forensic-watermark.git
