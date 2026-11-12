@@ -1,0 +1,37 @@
+# Media-processing pipeline config. Values come from CONTRACT.md section 4
+# (the agreed AWS pipeline contract). Do not invent values here.
+schema_version: 1
+profile: hevc-v1
+segment_duration_sec: 2
+gop_seconds: 2
+thumbnail_count: 6
+drm:
+  scheme: cbcs
+  systems: [Widevine, PlayReady, FairPlay]
+  clear_lead: 0
+ladder:
+  - {name: 720p, width: 1280, height: 720, target_kbps: 2800, maxrate_kbps: 3800, bufsize_kbps: 7600, nvenc_cq: 23}
+  - {name: 480p, width: 854,  height: 480, target_kbps: 1400, maxrate_kbps: 2200, bufsize_kbps: 4400, nvenc_cq: 23}
+  - {name: 360p, width: 640,  height: 360, target_kbps: 800,  maxrate_kbps: 1600, bufsize_kbps: 3200, nvenc_cq: 24}
+  - {name: 240p, width: 426,  height: 240, target_kbps: 600,  maxrate_kbps: 1200, bufsize_kbps: 2400, nvenc_cq: 25}
+input_contract:
+  require_cfr: true
+  reject_vfr: true
+  reject_hdr: true
+  max_bit_depth: 8
+  allowed_codecs: [h264, hevc]
+  allowed_pix_fmts: [yuv420p, nv12]
+  allowed_color_transfer: [bt709, smpte170m]
+  allowed_color_primaries: [bt709, smpte170m]
+  allowed_color_range: [tv]
+  require_even_dimensions: true
+  allowed_audio_codecs: [aac]
+  max_audio_streams: 1
+  allowed_containers: [mov, mp4, m4a, 3gp, 3g2, mj2]
+caps:
+  max_bytes: 2147483648
+  max_duration_sec: 3600
+  max_width: 3840
+  max_height: 2160
+  max_frames: 216000
+  max_streams: 8

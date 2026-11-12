@@ -1,0 +1,67 @@
+# Runtime settings for the AWS worker agent (CONTRACT.md sections 1, 2, 4, 5).
+#
+# This file is the ON-AMI DEFAULT; the deployment writes /etc/vg/worker.yaml
+# from it. Environment variables named in section 5 (VG_*) override every
+# sensitive or deployment-specific value here — the AMI image keeps
+# placeholders, never real credentials. Notably: storage class is NOT here,
+# because it is chosen per job from the sidecar `retention` field.
+schema_version: 1
+aws_region: us-east-1
+s3_bucket: ""                    # VG_S3_BUCKET, e.g. vg-media-dev / vg-media-prod
+
+queue:
+  jobs_url: ""                   # VG_SQS_QUEUE_URL,  e.g. https://sqs.../vg-video-jobs-prod
+  dlq_url: ""                    # VG_SQS_DLQ_URL,    e.g. https://sqs.../vg-video-jobs-prod-dlq
+  visibility_timeout_sec: 900    # visibility timeout the heartbeat refreshes
+  receive_wait_sec: 20           # single long poll; exactly ONE message is processed
+  max_receive_count: 3           # must equal the queue redrive maxReceiveCount
+
+webhook:
+  url: ""                        # VG_WEBHOOK_URL (Railway endpoint)
+  request_timeout_sec: 5
+  backoff: [1, 2, 4]             # seconds between the 3 retries (CONTRACT.md 3)
+  flush_timeout_sec: 5           # bounded wait for the final `done` POST
+
+deadlines:
+  job_sec: 3600                  # VG_JOB_DEADLINE_SEC; the worker enforces this itself
+  heartbeat_sec: 300             # every 300 s: visibility refresh + lock renewal
+  lock_ttl_sec: 1200             # _LOCK expires_at horizon (>= 2 heartbeats)
+  kill_grace_sec: 45             # SIGTERM at the deadline, SIGKILL 30-60 s later
+
+work_dir: /work                  # VG_WORK_DIR (100 GiB gp3, delete-on-termination)
+log_level: INFO                  # VG_LOG_LEVEL
+backend: cuda                    # generator `--backend`; never a plain-CPU run
+pipeline_config_path: /etc/vg/pipeline.yaml   # VG_CONFIG_PATH (pipeline.yaml)
+
+secret_file_dir: /run/vg-secrets # tmpfs; watermark secret file (0400, 10001)
+
+images:
+  generator: ""                  # VG_GENERATOR_IMAGE, e.g. <ecr>/forensic-wm-generator:hevc-v1-<sha>
+  validator: ""                  # VG_VALIDATOR_IMAGE, e.g. <ecr>/vg-validator:pinned-<sha>
+
+bins:
+  docker: docker
+  packager: /usr/local/bin/packager   # Shaka Packager, pinned on the AMI
+  ffprobe: /usr/local/bin/ffprobe     # pinned ffmpeg build 3a0867c2 (validator image)
+  ffmpeg:  /usr/local/bin/ffmpeg      # SECOND pinned ffmpeg (libx264 + h264_nvenc)
+
+secrets:
+  webhook_secret_arn: ""         # VG_WEBHOOK_SECRET_ARN
+  axinom_secret_arn: ""          # VG_AXINOM_SECRET_ARN
+  watermark_secret_arn: ""       # VG_WATERMARK_SECRET_ARN
+
+asg_name: ""                     # VG_ASG_NAME (self-termination target)
+
+# S3 key prefixes (CONTRACT.md section 1). Trailing slash is part of the key.
+prefixes:
+  incoming: incoming/
+  jobs: jobs/
+  masters: masters/
+  reports: reports/
+  renditions: renditions/
+
+# The DISK_FULL gate: fail closed when the free space is below
+# 2.5x source size + 20 GiB (launch template: 100 GiB gp3 encrypted).
+disk:
+  headroom_multiplier: 2.5
+  headroom_gib: 20
