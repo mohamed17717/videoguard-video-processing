@@ -1,0 +1,8 @@
+# Runtime Python dependencies for the worker AMI.
+# Versions are pinned to what was tested with Python 3.12 on this machine.
+# pycryptodome is needed at runtime: vg_pipeline.cenc signs Axinom key
+# requests with AES-256-CBC.
+pydantic==2.11.0
+PyYAML==6.0.2
+boto3==1.44.0
+pycryptodome==4.4.0
