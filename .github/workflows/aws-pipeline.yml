@@ -1,0 +1,509 @@
+# AWS video pipeline CI for the videoguard-video-processing repo (its own repo; also a submodule of video-guard).
+#
+# Layout notes (repo split, DeepSeek AGREEMENT: YES):
+#   - The former video-processing subtree moved to this repo ROOT; paths now
+#     carry no subdirectory prefix at all.
+#   - forensic-wm/ is a NESTED git submodule (public HTTPS, its own repo).
+#     Only the `images` job checks it out with `submodules: recursive`; no SSH
+#     key and no `webfactory/ssh-agent` are needed anywhere.
+#   - The Go backend stays in the video-guard repo, covered by that repo's
+#     own ci.yml. This workflow has no Go toolchain step at all.
+#
+# Jobs:
+#   1. validate        - Python tests (pytest tests) + Deno edge tests/typecheck.
+#   2. images          - build + push the two ECR images (OIDC); publishes the
+#                        full ECR refs as job outputs.
+#   3. packer          - packer validate (ungated, credential-free) + gated
+#                        packer build; publishes the AMI id as a job output.
+#   4. edge            - SOLE owner of the Bunny edge script: BUILD the bundle
+#                        (deno bundle -> edge/bunny/deploy/entry.js) then
+#                        idempotently create/update + publish via the Bunny API.
+#   5. terraform       - fmt + init(-backend=false) + validate (no PR plan).
+#   6. terraform-apply - gated real plan + apply on the production environment.
+#
+# Wiring: images -> packer -> terraform-apply. The AMI id and the two full ECR
+# refs flow through job outputs, never through a gitignored terraform.tfvars.
+#
+# DEFERRED GATES (CONTRACT.md section 11): a real Bunny API deploy, a real
+# Packer AMI build and a real terraform apply/plan need real accounts and
+# credentials; locally only parse/unit/deno gates ran. The exact Bunny API
+# field name / numeric script-id handling in the edge job is ALSO a deferred
+# gate - no real Bunny/AWS/Packer call has been made here.
+#
+# Secrets used (never hard-coded): AWS_OIDC_ROLE_ARN, BUNNY_API_KEY,
+#   CLOUDFLARE_API_TOKEN, EDGE_TOKEN_SECRET, the three Secrets Manager ARNs,
+#   TF_STATE_BUCKET. Variables (repo settings): EDGE_DEPLOY_ENABLED,
+#   EDGE_SCRIPT_NAME, EDGE_ORIGIN_HOST, WEBHOOK_HOST, WEBHOOK_PATH,
+#   PULL_ZONE_HOSTNAME, CLOUDFLARE_ZONE_ID.
+
+name: AWS video pipeline
+
+'on':
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# id-token: write is required for OIDC federation with AWS
+# (aws-actions/configure-aws-credentials + role-to-assume).
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1. validate: the fast, credential-free gate. No Go here (that backend
+  #    lives in the video-guard repo and has its own ci.yml).
+  # ---------------------------------------------------------------------
+  validate:
+    name: validate (python + deno)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies (incl. python-hcl2 + pytest)
+        run: |
+          python -m pip install --upgrade pip
+          pip install python-hcl2
+          pip install -r requirements-worker.txt
+          pip install -e ".[dev]"
+
+      # pytest runs ALL of tests/: the pipeline + worker suites AND the infra
+      # parse tests (test_hcl_parse.py uses python-hcl2, test_ci_yaml.py uses
+      # PyYAML). The workflow lives at this repo's root, so paths are relative
+      # to it (no subdirectory prefix).
+      - name: Run Python tests (pytest tests)
+        run: pytest tests -q
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.7
+
+      - name: Run Deno edge tests
+        run: deno test --allow-read edge/bunny/tests/
+
+      - name: Type-check the edge sources
+        run: deno check edge/bunny/src/*.ts
+
+  # ---------------------------------------------------------------------
+  # 2. images: build + push the generator and validator images to ECR.
+  #    The generator build context is forensic-wm/, a NESTED HTTPS submodule
+  #    populated by the checkout below with `submodules: recursive`. The full
+  #    ECR refs are published as job outputs for packer + terraform-apply.
+  # ---------------------------------------------------------------------
+  images:
+    name: build + push ECR images
+    needs: validate
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      generator_image: ${{ steps.refs.outputs.generator_image }}
+      validator_image: ${{ steps.refs.outputs.validator_image }}
+      registry: ${{ steps.refs.outputs.registry }}
+    env:
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # OIDC: no static AWS keys anywhere (CONTRACT.md section 10).
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve the ECR registry
+        id: ecr
+        run: |
+          account=$(aws sts get-caller-identity --query Account --output text)
+          echo "registry=${account}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> "$GITHUB_OUTPUT"
+
+      # Context = forensic-wm/ (nested submodule; the checkout above populates
+      # it with `submodules: recursive`).
+      - name: Build the generator image
+        run: |
+          docker build --platform linux/amd64 \
+            -f forensic-wm/deploy/generator/Dockerfile \
+            -t ${{ steps.ecr.outputs.registry }}/forensic-wm-generator:hevc-v1-${{ github.sha }} \
+            forensic-wm
+
+      - name: Build the validator image
+        run: |
+          docker build --platform linux/amd64 \
+            -f deploy/validator/Dockerfile \
+            -t ${{ steps.ecr.outputs.registry }}/vg-validator:pinned-${{ github.sha }} \
+            .
+
+      - name: Push both images
+        run: |
+          docker push ${{ steps.ecr.outputs.registry }}/forensic-wm-generator:hevc-v1-${{ github.sha }}
+          docker push ${{ steps.ecr.outputs.registry }}/vg-validator:pinned-${{ github.sha }}
+
+      # Publish the FULL ECR refs (and the registry) as job outputs. Later
+      # jobs consume them; no placeholder and no gitignored tfvars file.
+      - name: Publish the full ECR image references
+        id: refs
+        run: |
+          echo "registry=${{ steps.ecr.outputs.registry }}" >> "$GITHUB_OUTPUT"
+          echo "generator_image=${{ steps.ecr.outputs.registry }}/forensic-wm-generator:hevc-v1-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "validator_image=${{ steps.ecr.outputs.registry }}/vg-validator:pinned-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------
+  # 3. packer: validate ALWAYS (ungated, credential-free). The build is
+  #    gated on a manual dispatch with images having succeeded; it emits
+  #    packer-manifest.json whose artifact_id is exposed as an ami_id output.
+  #    DEFERRED GATE until it runs with real AWS credentials.
+  # ---------------------------------------------------------------------
+  packer:
+    name: packer validate / build AMI
+    needs: [validate, images]
+    if: always() && needs.validate.result == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      ami_id: ${{ steps.ami.outputs.ami_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-packer@v3
+        with:
+          packer_version: '1.11.2'
+
+      - name: packer init
+        working-directory: deploy/packer
+        run: packer init .
+
+      # Kept UNGATED on purpose: `packer validate` is credential-free and must
+      # run on every push/PR, not only on a manual dispatch.
+      - name: packer validate
+        working-directory: deploy/packer
+        run: packer validate .
+
+      # OIDC for the build only (the validate/init steps above need no AWS).
+      - name: Configure AWS credentials via OIDC (build only)
+        if: github.event_name == 'workflow_dispatch' && needs.images.result == 'success'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: packer build (gated)
+        id: build
+        if: github.event_name == 'workflow_dispatch' && needs.images.result == 'success'
+        working-directory: deploy/packer
+        run: |
+          packer build \
+            -var "generator_image=${{ needs.images.outputs.generator_image }}" \
+            -var "validator_image=${{ needs.images.outputs.validator_image }}" \
+            .
+
+      # The manifest post-processor (deploy/packer/worker.pkr.hcl) writes
+      # packer-manifest.json with builds[0].artifact_id = "<region>:ami-...".
+      # Strip the region prefix and expose the bare AMI id as a JOB output so
+      # terraform-apply can pass -var ami_id=...
+      - name: Expose the built AMI id
+        id: ami
+        if: github.event_name == 'workflow_dispatch' && needs.images.result == 'success'
+        working-directory: deploy/packer
+        run: |
+          ami_id=$(jq -r '.builds[0].artifact_id | split(":")[-1]' packer-manifest.json)
+          test -n "$ami_id" || { echo "::error::packer-manifest.json carried no artifact_id for the AMI"; exit 1; }
+          echo "ami_id=${ami_id}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------
+  # 4. edge: CI is the SOLE owner of the Bunny edge script (D2).
+  #    Terraform deliberately does NOT manage it (infra/bunny.tf only owns
+  #    the pull zone). Ordering: CI runs on push/PR, terraform-apply is a
+  #    manual dispatch.
+  #    The deploy is a DEFERRED RUNTIME GATE: it runs only when
+  #    vars.EDGE_DEPLOY_ENABLED == 'true'. When the gate is off the job stays
+  #    green but prints a visible ::warning:: annotation - never a silent skip.
+  # ---------------------------------------------------------------------
+  edge:
+    name: build + deploy Bunny edge script
+    needs: validate
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    environment: production
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.7
+
+      - name: Offline sanity tests before deploy
+        run: |
+          deno test --allow-read edge/bunny/tests/
+          deno check edge/bunny/src/*.ts
+
+      # Build the plain-JS entry file the Bunny runtime expects. The entry is
+      # src/middleware.ts (BunnySDK servePullZone + onClientRequest/Response),
+      # NOT the pure handler in src/index.ts. Same command as locally (see
+      # edge/bunny/README.md); fails if the bundle is empty or lost the
+      # variant token.
+      - name: Build the Bunny runtime bundle
+        run: |
+          deno bundle --platform browser \
+            -o edge/bunny/deploy/entry.js \
+            edge/bunny/src/middleware.ts
+          test -s edge/bunny/deploy/entry.js
+          grep -q '__VG_VARIANT__' edge/bunny/deploy/entry.js
+          grep -q 'servePullZone' edge/bunny/deploy/entry.js
+
+      # IDEMPOTENT CREATE + UPDATE/PUBLISH (CI is the only owner of the edge
+      # script). The calls below follow the current Bunny Edge Scripting API
+      # (https://bunny.net/docs/scripting/api-reference):
+      #   - create: POST /compute/script {Name, Code, ScriptType: 2}
+      #   - update: POST /compute/script/{id}, then POST .../{id}/code {Code}
+      #   - config: PUT .../{id}/variables and PUT .../{id}/secrets
+      #   - publish: POST .../{id}/publish {Note}
+      # The script reads config with Deno.env.get (src/middleware.ts), not a
+      # synthetic global. CONTRACT.md section 11 still marks a real Bunny API
+      # call as a deferred gate; the shapes here are from the published docs.
+      - name: Deploy the edge script via the Bunny API
+        id: deploy
+        if: vars.EDGE_DEPLOY_ENABLED == 'true'
+        env:
+          VG_EDGE_SCRIPT_NAME: ${{ vars.EDGE_SCRIPT_NAME || 'vg-edge-prod' }}
+          EDGE_TOKEN_SECRET: ${{ secrets.EDGE_TOKEN_SECRET }}
+          EDGE_ORIGIN_HOST: ${{ vars.EDGE_ORIGIN_HOST }}
+          BUNNY_API_KEY: ${{ secrets.BUNNY_API_KEY }}
+        run: |
+          # FAIL CLOSED: both runtime settings are mandatory (B6).
+          test -n "$EDGE_TOKEN_SECRET" || { echo "::error::EDGE_TOKEN_SECRET secret is empty - VG_EDGE_TOKEN_SECRET is mandatory, the edge would answer 500 to every request"; exit 1; }
+          test -n "$EDGE_ORIGIN_HOST" || { echo "::error::EDGE_ORIGIN_HOST repo variable is empty - VG_EDGE_ORIGIN_HOST is mandatory, the edge would answer 500 to every request"; exit 1; }
+          test -n "$BUNNY_API_KEY" || { echo "::error::BUNNY_API_KEY secret is empty - the Bunny API deploy cannot authenticate"; exit 1; }
+
+          api="https://api.bunny.net"
+          script_name="$VG_EDGE_SCRIPT_NAME"
+          code_file="edge/bunny/deploy/entry.js"
+
+          # The list endpoint is paginated: {Items:[...]}; never assume a bare
+          # array. Resolve the script by name so creates are idempotent.
+          script_id=$(curl -fsS "$api/compute/script?perPage=1000" \
+            -H "AccessKey: $BUNNY_API_KEY" \
+            | jq -r --arg name "$script_name" \
+                '[.Items[]? | select(.Name == $name) | .Id] | first // empty')
+
+          if test -n "$script_id" && test "$script_id" != "null"; then
+            echo "edge script '$script_name' already exists (numeric Id=$script_id); updating"
+            curl -fsS -X POST "$api/compute/script/$script_id" \
+              -H "AccessKey: $BUNNY_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -cn --arg name "$script_name" '{Name:$name,ScriptType:2}')"
+            # The code endpoint is JSON {Code:string}; NOT a multipart upload.
+            curl -fsS -X POST "$api/compute/script/$script_id/code" \
+              -H "AccessKey: $BUNNY_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -Rs '{Code: .}' < "$code_file")"
+          else
+            echo "creating edge script '$script_name'"
+            # ScriptType 2 = Middleware. Capture the numeric .Id.
+            script_id=$(curl -fsS -X POST "$api/compute/script" \
+              -H "AccessKey: $BUNNY_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg name "$script_name" --rawfile code "$code_file" \
+                    '{Name:$name,ScriptType:2,Code:$code}')" \
+              | jq -r '.Id')
+            test -n "$script_id" && test "$script_id" != "null" || { echo "::error::Bunny create response carried no numeric script Id"; exit 1; }
+          fi
+
+          # Runtime config is Bunny environment variables/secrets (read by
+          # src/middleware.ts via Deno.env.get). The secret is sent only in
+          # this request body and is never echoed to the log.
+          curl -fsS -X PUT "$api/compute/script/$script_id/variables" \
+            -H "AccessKey: $BUNNY_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg name "VG_EDGE_ORIGIN_HOST" --arg value "$EDGE_ORIGIN_HOST" \
+                  '{Name:$name,Required:true,DefaultValue:$value}')"
+          curl -fsS -X PUT "$api/compute/script/$script_id/secrets" \
+            -H "AccessKey: $BUNNY_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg name "VG_EDGE_TOKEN_SECRET" --arg value "$EDGE_TOKEN_SECRET" \
+                  '{Name:$name,Secret:$value}')"
+
+          # Publish the current code as a release. JSON body, not multipart.
+          curl -fsS -X POST "$api/compute/script/$script_id/publish" \
+            -H "AccessKey: $BUNNY_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg note "CI deploy $GITHUB_SHA" '{Note:$note}')"
+
+          # Expose the numeric script Id for the pull-zone attachment step.
+          echo "script_id=${script_id}" >> "$GITHUB_OUTPUT"
+
+      # FINDING #22: publishing the script does not USE it anywhere. The
+      # pull zone must reference the numeric script Id via MiddlewareScriptId
+      # and run it before cache (EdgeScriptExecutionPhase: 2), or the zone
+      # keeps serving the LITERAL __VG_VARIANT__ placeholders from origin.
+      # Terraform owns the pull zone (infra/bunny.tf) but can never know the
+      # script Id - CI creates the script - so CI attaches it right after
+      # publishing. EDGE_PULL_ZONE_NAME must name the zone created by
+      # infra/bunny.tf ("vg-<env>-playback"; default = production).
+      #
+      # The step FAILS CLOSED: an unresolvable zone name aborts the deploy,
+      # it never leaves the published script unattached silently.
+      - name: Attach the edge script to the playback pull zone
+        if: vars.EDGE_DEPLOY_ENABLED == 'true'
+        env:
+          EDGE_PULL_ZONE_NAME: ${{ vars.EDGE_PULL_ZONE_NAME || 'vg-prod-playback' }}
+          EDGE_SCRIPT_ID: ${{ steps.deploy.outputs.script_id }}
+          BUNNY_API_KEY: ${{ secrets.BUNNY_API_KEY }}
+        run: |
+          # FAIL CLOSED: a missing zone name or script Id must abort.
+          test -n "$EDGE_PULL_ZONE_NAME" || { echo "::error::EDGE_PULL_ZONE_NAME resolved to empty - the pull zone to attach cannot be identified"; exit 1; }
+          test -n "$BUNNY_API_KEY" || { echo "::error::BUNNY_API_KEY secret is empty - the Bunny API attach cannot authenticate"; exit 1; }
+          case "$EDGE_SCRIPT_ID" in
+            ''|*[!0-9]*) echo "::error::the publish step produced no numeric edge script Id ('$EDGE_SCRIPT_ID') - refusing to attach a non-numeric MiddlewareScriptId"; exit 1 ;;
+          esac
+
+          api="https://api.bunny.net"
+
+          # Resolve the pull zone by NAME (the zone is owned by
+          # infra/bunny.tf; its Id is never hardcoded here).
+          zone_id=$(curl -fsS "$api/pullzone" \
+            -H "AccessKey: $BUNNY_API_KEY" \
+            | jq -r --arg name "$EDGE_PULL_ZONE_NAME" \
+                '[.[]? | select(.Name == $name) | .Id] | first // empty')
+          if test -z "$zone_id" || test "$zone_id" = "null"; then
+            echo "::error::Bunny pull zone '$EDGE_PULL_ZONE_NAME' was not found - the edge script would never be attached and the zone would serve literal __VG_VARIANT__ manifests. Create the zone (infra/bunny.tf) or set vars.EDGE_PULL_ZONE_NAME to the real zone name."
+            exit 1
+          fi
+
+          # Attach and run BEFORE cache: onClientRequest only runs in phase 2.
+          curl -fsS -X POST "$api/pullzone/$zone_id" \
+            -H "AccessKey: $BUNNY_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --argjson scriptId "$EDGE_SCRIPT_ID" \
+                  '{MiddlewareScriptId:$scriptId,EdgeScriptExecutionPhase:2}')"
+
+          echo "edge script $EDGE_SCRIPT_ID attached to pull zone '$EDGE_PULL_ZONE_NAME' (Id=$zone_id) with execution phase 2 (before cache)"
+
+      # Visible skip: the gate being off must show up as an annotation, not
+      # as silent green.
+      - name: Notice when the deploy gate is off
+        if: vars.EDGE_DEPLOY_ENABLED != 'true'
+        run: |
+          echo "::warning::Bunny edge deploy is a DEFERRED RUNTIME GATE (CONTRACT.md section 11): vars.EDGE_DEPLOY_ENABLED is not 'true', so the built bundle was NOT deployed to Bunny. The bundle build above still validated the edge script."
+
+  # ---------------------------------------------------------------------
+  # 5. terraform: fmt + init(-backend=false) + validate ALWAYS. There is NO
+  #    PR `terraform plan` step: a -backend=false plan has no AWS credentials
+  #    while infra/data.tf reads caller identity / the default VPC, so it is
+  #    not a real plan. A real plan runs in terraform-apply (OIDC + real
+  #    backend) only.
+  #    DEFERRED GATE: terraform validate needs the real terraform binary
+  #    (CI); locally the .tf files were only parsed with python-hcl2.
+  # ---------------------------------------------------------------------
+  terraform:
+    name: terraform fmt / init / validate
+    needs: validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.8'
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive .
+
+      # -backend=false: no state bucket is needed to validate the code.
+      - name: terraform init
+        run: terraform init -backend=false
+
+      - name: terraform validate
+        run: terraform validate
+
+  # ---------------------------------------------------------------------
+  # 6. terraform-apply: manual approval via the production environment.
+  #    Real state bucket + lock table come from infra/bootstrap-state.sh.
+  #    All inputs come from TF_VAR_* (GitHub vars/secrets) and the three job
+  #    outputs (AMI id + the two ECR refs) - NO gitignored terraform.tfvars.
+  # ---------------------------------------------------------------------
+  terraform-apply:
+    name: terraform apply (gated)
+    needs: [terraform, images, packer]
+    if: github.event_name == 'workflow_dispatch'
+    environment: production
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1
+      TF_VAR_env: prod
+      TF_VAR_webhook_host: ${{ vars.WEBHOOK_HOST }}
+      TF_VAR_webhook_path: ${{ vars.WEBHOOK_PATH }}
+      TF_VAR_pull_zone_hostname: ${{ vars.PULL_ZONE_HOSTNAME }}
+      TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
+      TF_VAR_bunny_api_key: ${{ secrets.BUNNY_API_KEY }}
+      TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_webhook_secret_arn: ${{ vars.WEBHOOK_SECRET_ARN }}
+      TF_VAR_axinom_secret_arn: ${{ vars.AXINOM_SECRET_ARN }}
+      TF_VAR_watermark_secret_arn: ${{ vars.WATERMARK_SECRET_ARN }}
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.8'
+
+      # FAIL CLOSED: an empty Bunny/Cloudflare value makes infra/bunny.tf's
+      # local-exec take its skip branch (the pull zone is silently NOT managed
+      # and the apply would still succeed). Empty image/AMI outputs would
+      # launch workers with no images. So every one is guarded here.
+      - name: Fail closed on empty deploy inputs
+        run: |
+          test -n "$TF_VAR_bunny_api_key" || { echo "::error::BUNNY_API_KEY is empty - infra/bunny.tf would silently skip the pull zone"; exit 1; }
+          test -n "$TF_VAR_cloudflare_api_token" || { echo "::error::CLOUDFLARE_API_TOKEN is empty - the Cloudflare CNAME would be skipped"; exit 1; }
+          test -n "$TF_VAR_cloudflare_zone_id" || { echo "::error::CLOUDFLARE_ZONE_ID is empty"; exit 1; }
+          test -n "$TF_VAR_webhook_host" || { echo "::error::WEBHOOK_HOST is empty"; exit 1; }
+          test -n "$TF_VAR_webhook_path" || { echo "::error::WEBHOOK_PATH is empty"; exit 1; }
+          test -n "$TF_VAR_pull_zone_hostname" || { echo "::error::PULL_ZONE_HOSTNAME is empty"; exit 1; }
+          test -n "${{ needs.images.outputs.generator_image }}" || { echo "::error::generator_image job output is empty"; exit 1; }
+          test -n "${{ needs.images.outputs.validator_image }}" || { echo "::error::validator_image job output is empty"; exit 1; }
+          test -n "${{ needs.packer.outputs.ami_id }}" || { echo "::error::ami_id job output is empty"; exit 1; }
+
+      # Real backend: the state bucket created by bootstrap-state.sh.
+      - name: terraform init (real backend)
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="dynamodb_table=vg-tfstate-lock"
+
+      # A REAL plan (OIDC + real backend) before apply. The three pinned
+      # build artifacts are passed as -var; everything else is a TF_VAR_* env.
+      - name: terraform plan
+        run: |
+          terraform plan -input=false -no-color -out=tfplan \
+            -var "ami_id=${{ needs.packer.outputs.ami_id }}" \
+            -var "generator_image=${{ needs.images.outputs.generator_image }}" \
+            -var "validator_image=${{ needs.images.outputs.validator_image }}"
+
+      - name: terraform apply
+        run: terraform apply -input=false -auto-approve tfplan
