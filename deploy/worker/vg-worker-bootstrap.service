@@ -1,0 +1,33 @@
+# Boot-time configuration loader for the worker agent.
+#
+# Reads the launch template's user_data through IMDSv2 and atomically writes
+# /etc/vg/worker.env before worker-agent.service starts. A failure here is
+# FATAL on purpose: worker-agent.service Requires= this unit, so the agent
+# never starts with an empty configuration (see deploy/worker/bootstrap-env.sh).
+#
+# Installed by deploy/worker/install.sh into /etc/systemd/system/.
+
+[Unit]
+Description=video-guard worker boot configuration loader (user-data -> /etc/vg/worker.env)
+Documentation=https://github.com/mohamed17717/videoguard-video-processing
+Wants=network-online.target
+After=network-online.target
+Before=worker-agent.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/opt/vg/bootstrap-env.sh
+RemainAfterExit=yes
+
+# Hardening: the loader only reads IMDS over the network and writes the
+# generated env file. /etc/vg is the single writable path.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/etc/vg
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

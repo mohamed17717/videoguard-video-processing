@@ -1,0 +1,54 @@
+# systemd unit for the video-guard worker agent (host service, NOT a
+# container with /var/run/docker.sock — CONTRACT.md section 8).
+#
+# Installed by deploy/worker/install.sh into /etc/systemd/system/. The agent
+# runs as the non-root `vgworker` user (created by install.sh with the docker
+# group so the CLI can reach the socket). One unit run = exactly ONE SQS
+# message, then the instance terminates itself; Restart=no on purpose. The
+# StopTimeout* settings give the supervisor SIGTERM/SIGKILL escalation a
+# bounded 90 s window after the job deadline.
+
+[Unit]
+Description=video-guard AWS worker agent (one job per boot)
+Documentation=https://github.com/mohamed17717/videoguard-video-processing
+Wants=network-online.target
+# The boot loader writes /etc/vg/worker.env from launch-template user data.
+# Requiring it means a missing/invalid user-data fails THIS unit's start
+# instead of running the agent with an empty config.
+Requires=vg-worker-bootstrap.service
+After=network-online.target docker.service vg-worker-bootstrap.service
+# Require the tmpfs that holds the watermark secret file (0400, owner
+# 10001:10001); systemd mounts it before this unit starts.
+RequiresMountsFor=/run/vg-secrets
+
+[Service]
+Type=oneshot
+User=vgworker
+Group=vgworker
+# EnvironmentFile is generated at boot by vg-worker-bootstrap.service
+# (secret-free VG_* names + deployment values). Secret VALUES never live
+# here - the agent fetches them from Secrets Manager at run time.
+EnvironmentFile=/etc/vg/worker.env
+# docker login (entrypoint.sh) writes its credential file under this
+# vgworker-owned directory; /var/lib/vgworker is writable (ReadWritePaths).
+Environment=DOCKER_CONFIG=/var/lib/vgworker/.docker
+WorkingDirectory=/opt/vg
+ExecStart=/opt/vg/venv/bin/entrypoint-worker.sh
+ExecStop=/bin/kill -TERM $MAINPID
+# One job is one process run: never restart into a second message. A crashed
+# job leaves visibility to let SQS redeliver to a FRESH instance (CONTRACT.md 2).
+Restart=no
+# SIGTERM -> 90 s -> SIGKILL from systemd covers the in-process kill grace
+# (30-60 s) plus process exit; bounded as the contract requires.
+TimeoutStopSec=90
+KillMode=control-group
+# Hardening: read-only most of the box; the agent needs docker socket access,
+# the /work data volume and its own tmpfs.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/work /var/lib/vgworker /run/vg-secrets
+PrivateTmp=false
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
