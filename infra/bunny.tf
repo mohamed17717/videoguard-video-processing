@@ -8,12 +8,13 @@
 # by the sensitive var.bunny_api_key.
 #
 # D2 OWNERSHIP SPLIT:
-#   The edge script (create + VG_EDGE_PARAMS + publish) is owned by
+#   The edge script (create + env vars/secrets + publish) is owned by
 #   .github/workflows/aws-pipeline.yml job `edge`; Terraform deliberately
 #   does NOT manage it (ordering: CI runs on push, terraform-apply is a
 #   manual dispatch). The edge token secret and origin host therefore live
-#   only in GitHub secrets/vars (EDGE_TOKEN_SECRET / EDGE_ORIGIN_HOST) and
-#   never in tfvars or Terraform state.
+#   only in GitHub secrets/vars (EDGE_TOKEN_SECRET / EDGE_ORIGIN_HOST); CI
+#   writes them to the Bunny script as env/secret and they never enter
+#   tfvars or Terraform state.
 #
 # What is and is NOT in Terraform state:
 #   - the pull-zone payload JSON (below) IS hashed into the pull-zone
@@ -34,11 +35,11 @@
 #     this INCLUDES the CORS fields EnableCORS / CorsAllowedOrigins added
 #     for personalised-manifest CORS - their exact names and accepted
 #     values are unverified (no real Bunny API call has been made);
-#   - the EdgeScriptId attachment of the edge script to THIS zone is done
-#     by CI job "edge" (aws-pipeline.yml) right after the script publish -
-#     its exact endpoint/verb/field shape is likewise a deferred gate, and
-#     the zone payload here deliberately does NOT pin a script id (CI owns
-#     the script and only CI knows its numeric Id);
+#   - the MiddlewareScriptId attachment of the edge script to THIS zone is
+#     done by CI job "edge" (aws-pipeline.yml) right after the script publish,
+#     together with EdgeScriptExecutionPhase = 2 (run before cache). The zone
+#     payload here deliberately does NOT pin a script id (CI owns the script
+#     and only CI knows its numeric Id);
 #   - actually DEPLOYING to a real Bunny account (CI job "edge", gated on
 #     vars.EDGE_DEPLOY_ENABLED = 'true' + the production environment) and
 #     the real edge runtime behaviour remain deferred runtime gates.

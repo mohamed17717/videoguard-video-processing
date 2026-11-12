@@ -531,24 +531,29 @@ total).
   still rejected. The verified token's `job_id` must match the requested path
   prefix (`/<job_id>/...`), or the request is 403. No S3 credentials in the
   edge script.
-- **Fail closed:** `VG_EDGE_PARAMS` MUST supply BOTH `tokenSecret` (equal to
-  the backend's `PLAYBACK_EDGE_TOKEN_SECRET`) and `originHost`; an empty either
-  returns 500 on every request. CI's `edge` job
+- **Fail closed:** Bunny environment variables/secrets MUST supply BOTH
+  `VG_EDGE_TOKEN_SECRET` (equal to the backend's
+  `PLAYBACK_EDGE_TOKEN_SECRET`) and `VG_EDGE_ORIGIN_HOST`; an empty either
+  returns 500 on every request. The published entry uses Bunny's documented
+  middleware API (`BunnySDK.net.http.servePullZone` with `onClientRequest` /
+  `onClientResponse`) and reads both with `Deno.env.get`. CI's `edge` job
   (`.github/workflows/aws-pipeline.yml`) is the SOLE owner of the edge script:
   it reads GitHub `secrets.EDGE_TOKEN_SECRET` / `vars.EDGE_ORIGIN_HOST` and
-  injects `VG_EDGE_PARAMS`; Terraform deliberately does NOT manage the edge
-  script (`infra/bunny.tf` owns only the pull zone + Cloudflare DNS). The exact
-  Bunny API field name for script parameters and the numeric script Id handling
-  are §11 deferred gates.
+  writes them through `PUT /compute/script/{id}/secrets` and
+  `PUT /compute/script/{id}/variables`; Terraform deliberately does NOT manage
+  the edge script (`infra/bunny.tf` owns only the pull zone + Cloudflare DNS).
+  The real Bunny API call, live env/secret injection and numeric script Id
+  handling are §11 deferred gates.
 - Manifest responses: `Cache-Control: private, no-store`, pull-zone cache bypass
   for `*.m3u8`/`*.mpd`, plus CORS (`Access-Control-Allow-Origin`, methods,
   headers incl. `Range`, exposed `Content-Length`/`Content-Range`/`ETag`,
   `Vary: Origin`). Segments: `Cache-Control: public, max-age=31536000,
   immutable`.
 - The CI `edge` job also ATTACHES the published script to the playback pull
-  zone (`EdgeScriptId` = the numeric script Id); without it the zone serves the
-  canonical `__VG_VARIANT__` manifests. The exact Bunny endpoint/field is a §11
-  deferred gate.
+  zone (`MiddlewareScriptId` = the numeric script Id and
+  `EdgeScriptExecutionPhase: 2` so the client hook runs before cache); without
+  it the zone serves the canonical `__VG_VARIANT__` manifests. The real Bunny
+  API call is a §11 deferred gate.
 - Playback API returns `hls_manifest_path` (NOT `hls_playlist_path`) and
   `dash_manifest_path`; the SDK already prefers `hls_manifest_path`. Do not
   modify the `sdk/` submodule in the `video-guard` repo.
@@ -782,17 +787,18 @@ environment.
 - **Axinom:** golden-vector tests only; live key request / license issuance /
   FairPlay SPC-CKC are gates.
 - **Bunny Edge/CDN:** Deno unit tests, the `deno bundle` →
-  `edge/bunny/deploy/entry.js` build, and the CI `edge` job's ownership of the
-  script (create + `VG_EDGE_PARAMS` + publish, reading GitHub
-  `secrets.EDGE_TOKEN_SECRET` / `vars.EDGE_ORIGIN_HOST`) are written and
-  structurally tested locally; the real edge runtime, the exact Bunny API
-  field name for script parameters (`EdgeScriptParams`) AND the numeric
+  `edge/bunny/deploy/entry.js` build (entry `src/middleware.ts`), and the CI
+  `edge` job's ownership of the script (create/update + env vars/secrets +
+  publish + attach, reading GitHub `secrets.EDGE_TOKEN_SECRET` /
+  `vars.EDGE_ORIGIN_HOST`) are written and structurally tested locally. The
+  real edge runtime, the live Bunny variable/secret injection, the numeric
   script Id handling (list-by-name → capture `.Id` from the create response →
-  publish to `/compute/script/<Id>/publish`, never by name),
-  `VG_EDGE_PARAMS` injection, script deployment, origin signing,
+  upload with `POST /compute/script/<Id>/code` → publish to
+  `/compute/script/<Id>/publish`, never by name), the pull-zone attach using
+  `MiddlewareScriptId` + `EdgeScriptExecutionPhase: 2`, origin signing,
   distinct-origin-host recursion semantics, cache-bypass rules, CORS field
-  names (`EnableCORS`/`CorsAllowedOrigins`), the pull-zone `EdgeScriptId`
-  attach endpoint/verb, and HLS master token-propagation behaviour are gates.
+  names (`EnableCORS`/`CorsAllowedOrigins`), and HLS master token-propagation
+  behaviour are gates.
 - **ClamAV:** validator image + EICAR test is a gate.
 - **S3 object purge on video deletion** (no design or IAM yet) is a follow-up,
   not something claimed fixed locally.

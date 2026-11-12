@@ -88,14 +88,15 @@ unverified provider would hide real API mismatches behind a green plan. So:
   `'true'` (plus the production environment approval); otherwise the job
   prints a `::warning::` annotation and stays green. See
   `../edge/bunny/README.md`.
-- **The edge script's runtime parameters (`VG_EDGE_PARAMS`) are supplied by
-  the same CI `edge` job**, because the script answers **500 to every
-  request** without them (fail closed, see `../edge/bunny/README.md`). CI
-  reads GitHub `secrets.EDGE_TOKEN_SECRET` and `vars.EDGE_ORIGIN_HOST` and
-  wraps the pair as a JSON string
-  (`{"tokenSecret":"...","originHost":"..."}`) under the `EdgeScriptParams`
-  field of the create/update payload, failing the job with a `::error::`
-  when either is empty. They are NOT Terraform variables — keeping them out
+- **The edge script's runtime configuration is supplied by the same CI
+  `edge` job**, because the script answers **500 to every request** without
+  it (fail closed, see `../edge/bunny/README.md`). CI reads GitHub
+  `secrets.EDGE_TOKEN_SECRET` and `vars.EDGE_ORIGIN_HOST` and writes them
+  through the documented Bunny API
+  (`PUT /compute/script/{id}/secrets` and `PUT /compute/script/{id}/variables`),
+  failing the job with a `::error::` when either is empty. The script reads
+  them with `Deno.env.get` as `VG_EDGE_TOKEN_SECRET` /
+  `VG_EDGE_ORIGIN_HOST`. They are NOT Terraform variables — keeping them out
   of Terraform means they can never land in tfvars or Terraform state. Two
   requirements:
   - `EDGE_TOKEN_SECRET` MUST equal the `PLAYBACK_EDGE_TOKEN_SECRET` set on
@@ -147,9 +148,9 @@ No terraform/packer/aws CLI and no real accounts exist in this environment
 - the CI workflow parses with PyYAML (`../tests/infra/test_ci_yaml.py`),
 - the D2 ownership split is asserted by the additive parse test: the
   `edge_token_secret` / `edge_origin_host` variables do NOT exist anywhere
-  in Terraform, no `.tf` file touches `compute/script` or `EdgeScriptParams`,
-  and the CI `edge` job is the sole owner feeding `EDGE_TOKEN_SECRET` /
-  `EDGE_ORIGIN_HOST` into the deploy step,
+  in Terraform, no `.tf` file touches `compute/script` or the edge runtime
+  config, and the CI `edge` job is the sole owner feeding
+  `EDGE_TOKEN_SECRET` / `EDGE_ORIGIN_HOST` into the deploy step,
 - the Bunny edge script passes `deno test` / `deno check`
   (`../edge/bunny/`).
 
@@ -160,10 +161,11 @@ What is NOT verified here and must run in CI or a real account:
 - S3 event → SQS delivery shape, queue policy acceptance,
 - lifecycle `days = 0` GLACIER_IR transitions + the 128 KiB / 90-day minimums
   against a real bucket,
-- Bunny API payload field names (pull zone, and the edge-script
-  `EdgeScriptParams` field that carries the `VG_EDGE_PARAMS` parameters —
-  now sent by the CI `edge` job) and the real edge runtime behaviour
-  (parameter injection, the numeric script Id, and publish included),
+- Bunny API payload field names (pull zone, the edge-script
+  variable/secret endpoints, and the `MiddlewareScriptId` +
+  `EdgeScriptExecutionPhase` attach fields — now used by the CI `edge` job)
+  and the real edge runtime behaviour (environment-variable injection, the
+  numeric script Id, and publish included),
 - Cloudflare record apply and custom-hostname certificate issuance,
 - ASG scale-out and worker self-termination on a real `g6.xlarge`.
 
