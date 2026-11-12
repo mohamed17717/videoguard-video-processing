@@ -1,0 +1,7 @@
+{
+  "tasks": {
+    "test": "deno test --allow-read tests/",
+    "check": "deno check src/*.ts",
+    "bundle": "deno bundle --platform browser -o deploy/entry.js src/middleware.ts"
+  }
+}
