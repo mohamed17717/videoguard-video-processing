@@ -152,7 +152,7 @@ def test_paths_are_repo_root_relative() -> None:
     assert "deno check edge/bunny/src/*.ts" in raw
     assert "deno bundle" in raw
     assert "-o edge/bunny/deploy/entry.js" in raw
-    assert "edge/bunny/src/index.ts" in raw
+    assert "edge/bunny/src/middleware.ts" in raw
     assert "-f deploy/validator/Dockerfile" in raw
     assert "working-directory: infra" in raw
     assert "working-directory: deploy/packer" in raw
@@ -291,7 +291,7 @@ def test_edge_job_really_builds_the_bundle() -> None:
     assert build_runs, "the edge job must run deno bundle"
     run = build_runs[0]
     assert "-o edge/bunny/deploy/entry.js" in run
-    assert "edge/bunny/src/index.ts" in run
+    assert "edge/bunny/src/middleware.ts" in run
     assert "--platform browser" in run
     # The bundle is a tracked artifact CI owns; it must exist and still carry
     # the variant token the build check greps for.
@@ -327,9 +327,10 @@ def test_edge_deploy_is_a_visible_gate_not_a_silent_skip() -> None:
 def test_edge_create_is_idempotent_and_publishes_by_numeric_id() -> None:
     """(f) CI is the SOLE owner. The create is idempotent: list-by-name first,
     then create (capture the numeric .Id with jq) OR update; publish goes to
-    .../<id>/publish, NEVER to the script name. VG_EDGE_PARAMS carries the
-    two parameters and the deploy fails closed on either being empty. The
-    exact Bunny field/id handling remains a CONTRACT section 11 deferred gate."""
+    .../<id>/publish, NEVER to the script name. Runtime config uses the
+    documented environment-variable/secret endpoints, and the deploy fails
+    closed on either value being empty. A real Bunny API call remains a
+    CONTRACT section 11 deferred gate."""
     workflow = _workflow()
     edge_steps = _steps(workflow, "edge")
     deploy = next(
@@ -337,25 +338,28 @@ def test_edge_create_is_idempotent_and_publishes_by_numeric_id() -> None:
     )
     run = str(deploy["run"])
     assert "compute/script" in run
-    # Idempotent: list by name -> select numeric .Id; update existing with PUT.
+    # Idempotent: list-by-name -> select numeric .Id; update the existing
+    # script (metadata + code), never recreate it.
     assert "select(.Name == $name)" in run, "list-by-name then reuse the numeric Id"
-    assert "-X PUT" in run, "an existing script must be updated, not recreated"
+    assert ".Items[]?" in run, "the paginated list response shape is {Items:[...]}"
+    assert "$script_id/code" in run, "an existing script's code must be updated"
+    assert '$script_id"' in run and "-X POST" in run
     # Capture the create response's numeric .Id with jq.
     assert "jq -r '.Id'" in run, "the create response's numeric .Id must be captured"
     # Publish to the numeric id, NOT the script name.
     assert "$script_id/publish" in run, "publish to .../Id/publish"
     assert "$VG_EDGE_SCRIPT_NAME/publish" not in run, "never publish by script name"
-    # VG_EDGE_PARAMS / EdgeScriptParams with both parameters.
-    assert "VG_EDGE_PARAMS" in run
-    assert "EdgeScriptParams" in run
-    assert "tokenSecret" in run and "originHost" in run
+    # Runtime config is environment variables/secrets, read by Deno.env.
+    assert "VG_EDGE_ORIGIN_HOST" in run and "VG_EDGE_TOKEN_SECRET" in run
+    assert "$script_id/variables" in run and "$script_id/secrets" in run
+    assert "ScriptType:2" in run
     # B6 fail-closed guards.
     assert "::error::" in run
     assert "EDGE_TOKEN_SECRET" in run and "EDGE_ORIGIN_HOST" in run
     assert "jq -cn --arg" in run
     # Deferred gate is documented, not claimed as verified.
     assert "DEFERRED GATE" in run or "DEFERRED GATE" in _raw_text()
-    assert "docs.bunny.net" in _raw_text()
+    assert "bunny.net/docs/scripting" in _raw_text()
 
 
 def test_edge_script_is_owned_by_ci_not_terraform() -> None:
@@ -376,7 +380,15 @@ def test_edge_script_is_owned_by_ci_not_terraform() -> None:
     deploy_run = str(deploy["run"])
     assert "compute/script" in deploy_run, "CI must CREATE the edge script"
     assert "publish" in deploy_run, "CI must PUBLISH the edge script"
-    assert "EdgeScriptParams" in deploy_run, "CI must own VG_EDGE_PARAMS"
+    assert "VG_EDGE_TOKEN_SECRET" in deploy_run, "CI must own the runtime secret"
+    assert "VG_EDGE_ORIGIN_HOST" in deploy_run, "CI must own the runtime origin"
+
+    attach = next(
+        s for s in edge_steps if "Attach the edge script" in str(s.get("name", ""))
+    )
+    attach_run = str(attach["run"])
+    assert "MiddlewareScriptId" in attach_run, "attach as a middleware script"
+    assert "EdgeScriptExecutionPhase" in attach_run, "run before cache"
 
     # Terraform: only the pull zone; NO compute/script and NO edge-script shell.
     bunny_text = (VIDEO_PROCESSING_ROOT / "infra" / "bunny.tf").read_text(encoding="utf-8")

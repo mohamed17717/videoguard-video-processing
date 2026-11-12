@@ -401,9 +401,13 @@ def test_bunny_tf_manages_only_the_pull_zone() -> None:
     assert "edge/bunny/deploy/entry.js" not in text, (
         "the edge bundle is built + published by CI, not Terraform"
     )
-    # CI still owns the built bundle as a tracked artifact.
+    # CI still owns the built bundle as a tracked artifact. It must be the
+    # documented Bunny middleware entry, not the old Deno.serve/global shim.
     assert EDGE_BUNDLE_PATH.is_file(), "deploy/entry.js must exist as an artifact"
-    assert "__VG_VARIANT__" in EDGE_BUNDLE_PATH.read_text(encoding="utf-8")
+    bundle = EDGE_BUNDLE_PATH.read_text(encoding="utf-8")
+    assert "__VG_VARIANT__" in bundle
+    assert "servePullZone" in bundle, "the bundle must use Bunny servePullZone"
+    assert "VG_EDGE_PARAMS" not in bundle, "the old runtime shim must be gone"
 
 
 def test_ecr_tf_declares_both_repositories_immutable_and_scanned() -> None:
@@ -726,9 +730,10 @@ def test_edge_secret_is_ci_only_never_in_terraform_state() -> None:
 
     Terraform has NO edge-token/origin variables, NO edge-script create call
     and NO secret in state. The CI `edge` job is the SOLE owner: it creates
-    (idempotently), publishes and injects VG_EDGE_PARAMS (tokenSecret +
-    originHost), and fails closed when either is empty. The token secret is
-    therefore a GitHub secret only - it can never land in tfvars/state
+    (idempotently), publishes and injects the runtime configuration as Bunny
+    environment variables/secrets (VG_EDGE_ORIGIN_HOST, VG_EDGE_TOKEN_SECRET),
+    and fails closed when either is empty. The token secret is therefore a
+    GitHub secret only - it can never land in tfvars/state
     (CONTRACT.md sections 10 and 11).
     """
     import yaml
@@ -745,7 +750,7 @@ def test_edge_secret_is_ci_only_never_in_terraform_state() -> None:
     )
 
     # No .tf file may create the edge script, reference the removed secret
-    # variables, or carry the VG_EDGE_PARAMS payload. Trigger values (and
+    # variables, or carry the edge runtime configuration. Trigger values (and
     # resource attributes in general) land in Terraform state, so the secret
     # must not appear anywhere in the .tf files.
     for name in TERRAFORM_FILENAMES:
@@ -759,8 +764,8 @@ def test_edge_secret_is_ci_only_never_in_terraform_state() -> None:
         assert "edge_origin_host" not in text, (
             f"{name}: the origin host must be gone from Terraform"
         )
-        assert "EdgeScriptParams" not in text, (
-            f"{name}: VG_EDGE_PARAMS belongs to the CI edge job only"
+        assert "VG_EDGE_PARAMS" not in text and "EdgeScriptParams" not in text, (
+            f"{name}: edge runtime config belongs to the CI edge job only"
         )
         assert isinstance(load_infra(name), dict), f"{name}: hcl2 parse failed"
 
@@ -795,11 +800,16 @@ def test_edge_secret_is_ci_only_never_in_terraform_state() -> None:
     for needle in (
         "EDGE_TOKEN_SECRET",
         "EDGE_ORIGIN_HOST",
+        "VG_EDGE_TOKEN_SECRET",
+        "VG_EDGE_ORIGIN_HOST",
         "::error::",
-        "EdgeScriptParams",
         "jq -cn --arg",
         "compute/script",
+        "$script_id/variables",
+        "$script_id/secrets",
         "publish",
         "jq -r '.Id'",
+        "MiddlewareScriptId",
+        "EdgeScriptExecutionPhase",
     ):
         assert needle in run_text, f"the edge deploy step must contain {needle}"
