@@ -11,6 +11,8 @@ This repo is also registered as a git submodule of `video-guard` at the path
 `video-processing/`. Its own root-level CI/CD
 (`.github/workflows/aws-pipeline.yml`) is unchanged and runs on pushes to this
 repo; a push to `video-guard` only updates the gitlink and does NOT trigger it.
+It has one NESTED submodule: `forensic-wm/`, pinned to its own public HTTPS
+repo `https://github.com/mohamed17717/videoguard-forensic-watermark.git`.
 
 Everything here was written and unit-tested **offline** (no AWS account, no GPU,
 no terraform/packer binary in this environment). Anything that needs real AWS or
@@ -22,7 +24,7 @@ verified. The operator-facing deployment guide is
 
 | Piece | What it is |
 |---|---|
-| `forensic-wm/` (repo root) | The generator research subtree, **folded in as a plain directory** (NOT a **nested** git submodule). It contains the forensic-watermark generator and keeps publishing the generator image; nothing in it was renamed or edited by the move. It has its own `AGENTS.md`, `.dockerignore` and `.gitignore`. (`video-guard` pins this whole repo as a git submodule at `video-processing/`.) |
+| `forensic-wm/` (repo root) | The generator research subtree, a **NESTED git submodule** (NOT a plain directory), pinned to its own public HTTPS repo `https://github.com/mohamed17717/videoguard-forensic-watermark.git`. It contains the forensic-watermark generator and keeps publishing the generator image; nothing in it was renamed or edited. It has its own `AGENTS.md`, `.dockerignore` and `.gitignore`. (`video-guard` pins this whole repo as a git submodule at `video-processing/`.) |
 | `video-guard` (SEPARATE GitHub repo) | The **Go control plane**: upload sessions, presigned URLs, webhook receiver, DRM tokens, reconciliation (`internal/awscontrol/`, `internal/drm/`; RabbitMQ and Bunny Stream removed). Its CI is `video-guard/.github/workflows/ci.yml`. Nothing Go lives here. |
 | this repo's root (`src/`, `infra/`, `edge/`, `deploy/`, `tests/`, …) | All AWS pipeline code: worker library + agent, images, AMI, Terraform, edge script, tests, docs. |
 
@@ -35,19 +37,18 @@ with its own CI (`video-guard/.github/workflows/ci.yml`), where
 `go build ./... && go test ./...` runs. This repo calls into it (webhooks,
 playback tokens) but never compiles it.
 
-## Why `forensic-wm/` is folded in as a plain directory
+## Why `forensic-wm/` is a nested submodule
 
-`forensic-wm/` is a plain folder of files inside THIS repository — there is no
-**nested** git submodule (a pointer to a second repository), no `.gitmodules`,
-no SSH deploy key and no `submodules: recursive` checkout. One `git clone` gets the
-generator tree and the pipeline together; one CI `actions/checkout` sees all of
-it; one commit captures every change. A **nested** submodule for `forensic-wm`
-would need a second repository, a second commit, an SSH key wired into CI, and
-a special checkout step — three more moving parts for no benefit. Nothing
-inside `forensic-wm/`
-was renamed or rewritten by the fold-in (the Docker build context for the
-generator image is still `forensic-wm/`, so its `.dockerignore` allowlist keeps
-the extractor, tests, samples and `.env` out of the published image).
+The generator keeps its own repository, its own history and its own pinned
+commit: `https://github.com/mohamed17717/videoguard-forensic-watermark.git`,
+pinned in this repo's `.gitmodules`. A **git submodule** is a pointer to one
+pinned commit of a second repository, so a fresh clone needs
+`git clone --recurse-submodules` (or `actions/checkout` with
+`submodules: recursive`); GitHub "Download ZIP" and `git archive` do NOT
+include submodule contents. The submodule URL is public HTTPS, so no SSH
+deploy key and no `webfactory/ssh-agent` step are needed. The generator image
+build context is unchanged at `forensic-wm/`, so its `.dockerignore` allowlist
+keeps the extractor, tests, samples and `.env` out of the published image.
 
 ## The tree
 
@@ -102,10 +103,10 @@ video-processing/
 ├── .github/workflows/
 │   └── aws-pipeline.yml        # THIS repo's CI (pytest, Deno, images, packer,
 │                               #   edge deploy, terraform validate/apply)
-└── forensic-wm/                # generator research subtree — PLAIN DIRECTORY,
-    │                           #   not a submodule; own AGENTS.md/.dockerignore/
-    │                           #   .gitignore; Docker build context for the
-    │                           #   generator image
+└── forensic-wm/                # generator research subtree — NESTED git
+    │                           #   submodule (public HTTPS); own AGENTS.md/
+    │                           #   .dockerignore/.gitignore; Docker build
+    │                           #   context for the generator image
     └── ...                     # (untouched by the pipeline work)
 ```
 
