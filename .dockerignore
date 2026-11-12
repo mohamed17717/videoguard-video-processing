@@ -1,0 +1,28 @@
+# Root Docker build context rules.
+#
+# The VALIDATOR image is built with the context at this repo ROOT
+#   (docker build -f deploy/validator/Dockerfile -t <ecr>/vg-validator:pinned-<sha> .)
+# so this file decides what that context may contain. It must NOT contain
+# forensic-wm/ (CONTRACT.md section 0): the validator is a small ffprobe +
+# ClamAV image and must never carry the generator's research tree, samples
+# or outputs.
+#
+# The GENERATOR image is built with the context at forensic-wm/
+#   (docker build --platform linux/amd64 -f forensic-wm/deploy/generator/Dockerfile
+#    -t <ecr>/forensic-wm-generator:hevc-v1-<sha> forensic-wm)
+# which has its OWN .dockerignore allowlist (forensic-wm/.dockerignore), so
+# this root file does NOT affect that build at all.
+#
+# Deliberately NOT excluded: deploy/, src/, tests/, infra/, edge/, .github/
+# (harmless as context inputs and useful for cache/pin provenance).
+
+forensic-wm/
+.git/
+**/__pycache__/
+.pytest_cache/
+.ruff_cache/
+**/*.pyc
+node_modules/
+outputs/
+*.tfstate*
+.terraform/
