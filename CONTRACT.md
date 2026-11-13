@@ -102,8 +102,12 @@ presigner's credentials must be authorised for the PUT the browser will make);
 `s3:GetObject` on `jobs/<job_id>/*` (the `SidecarVideoResolver` in the webhook
 handler); `s3:GetObject` on `reports/<job_id>/*` and `renditions/<job_id>/*`
 plus `s3:ListBucket` scoped by an `s3:prefix` condition to those two prefixes
-(reconciliation); and `sqs:SendMessage` on the jobs queue. `pricing/SECURITY.md`
-§4 and `infra/iam.tf` carry the same list.
+(reconciliation); and `sqs:SendMessage` on the jobs queue. For custom
+thumbnails, it also needs `s3:PutObject`, `s3:GetObject`,
+`s3:GetObjectTagging`, `s3:DeleteObject`, and `s3:PutObjectTagging` on
+`renditions/*/thumbs/manual_*` to presign, validate and clean up the direct
+upload. `pricing/SECURITY.md` §4 and `infra/iam.tf` carry the pipeline access
+list.
 
 | Key | Content | Class | CDN |
 |---|---|---|---|
@@ -118,11 +122,35 @@ plus `s3:ListBucket` scoped by an `s3:prefix` condition to those two prefixes
 | `renditions/<job_id>/hls/master.m3u8`, `media_<quality>.m3u8`, `audio.m3u8` | canonical HLS manifests | Standard | yes (personalised by edge) |
 | `renditions/<job_id>/dash/stream.mpd` | canonical DASH manifest | Standard | yes (personalised by edge) |
 | `renditions/<job_id>/thumbs/thumb_NN.jpg` | 6 thumbnails | Standard | yes |
+| `renditions/<job_id>/thumbs/manual_<uuid>.<ext>` | user-uploaded thumbnail (`jpg`, `png`, or `webp`; max 5 MiB) | `GLACIER_IR` for `archive`; `STANDARD` for `ttl30` | yes |
 | `db-backups/` | unrelated, already exists | Deep Archive | never |
 
 Only `renditions/*` is readable by the Bunny origin identity (`s3:GetObject`).
 Thumbnails MUST live under `renditions/<job_id>/thumbs/` — a sibling `thumbs/`
 prefix is unreachable through a pull zone whose origin path is `renditions/`.
+User-uploaded thumbnails use the `manual_<uuid>` name so they cannot replace
+the worker's `thumb_NN.jpg` files. They are stored in the same job's rendition
+prefix and inherit that video's retention: archive uploads use `GLACIER_IR`
+from the first write, while `ttl30` uploads stay `STANDARD` and expire after
+30 days. Both generated and manual thumbnails remain CDN-readable through the
+existing Bunny rendition origin.
+
+**Manual thumbnail upload:** the dashboard asks the backend for a conditional presigned
+upload session with `POST /api/videos/:id/thumbnails/upload-session` and JSON
+`{ "content_type": "image/jpeg|image/png|image/webp", "size_bytes": n }`.
+The backend returns `upload_url`, `method: "PUT"`, the exact signed `headers`,
+an `upload_token`, and `max_size_bytes` (5 MiB). The browser PUTs the image
+bytes directly to S3 with those headers, then acknowledges it with
+`POST /api/videos/:id/thumbnails/upload-complete` and
+`{ "upload_token": "..." }`. The completion response is the existing Video
+response with its thumbnail collection refreshed. The backend validates the
+object and token before publishing the thumbnail in the database.
+
+The signed PUT headers include `Content-Type`, `If-None-Match: *`,
+`x-amz-storage-class` (`GLACIER_IR` for archive, `STANDARD` for `ttl30`) and
+`x-amz-tagging` (`vg-retention=archive|ttl30`). These prevent overwriting an
+existing thumbnail and make storage lifecycle behavior explicit. No checksum
+header is signed. S3 CORS must allow each signed header and expose `ETag`.
 
 A "segment" is a small (~2 s) media file. CMAF is a container format letting HLS
 and DASH share the same segments. HLS uses `.m3u8` playlists; DASH uses an
@@ -730,8 +758,8 @@ tests reference those packages. Follow this order and run
   keep the existing quota precheck/reservation. The dashboard MUST branch on
   this `upload` descriptor and PUT the file to S3 with XHR progress; the legacy
   Bunny TUS path remains only as a fallback when `upload` is absent.
-- Bucket CORS: `AllowedMethods=[PUT]`, `AllowedHeaders=[content-type]`,
-  `ExposeHeaders=[ETag]`.
+- Bucket CORS: `AllowedMethods=[PUT]`, `AllowedHeaders=[content-type,
+  if-none-match, x-amz-storage-class, x-amz-tagging]`, `ExposeHeaders=[ETag]`.
 - Bucket hardening: Block Public Access on, SSE-S3 or SSE-KMS,
   `BucketOwnerEnforced`, deny `aws:SecureTransport=false`, no ACLs.
 
