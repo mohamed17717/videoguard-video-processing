@@ -222,8 +222,9 @@ resource "aws_iam_instance_profile" "worker" {
 #     reconcile's listKeys calls ListObjectsV2, a BUCKET-level action, so
 #     the resource is the bucket itself and the s3:prefix condition carries
 #     the scope.
-# Still nothing else: no deletes, no storage-class signing, no writes beyond
-# jobs/* and incoming/*.
+# Manual thumbnail upload adds object permissions only on
+# renditions/*/thumbs/manual_*; it does not grant access to other rendition
+# outputs.
 resource "aws_iam_user" "backend" {
   name = var.railway_iam_user_name
 }
@@ -299,6 +300,24 @@ data "aws_iam_policy_document" "backend" {
     effect    = "Allow"
     actions   = ["sqs:SendMessage"]
     resources = [aws_sqs_queue.jobs.arn]
+  }
+
+  # Manual thumbnail uploads use conditional presigned PUTs. Keep these
+  # permissions to the thumbnail subprefix; the backend cannot modify
+  # pipeline renditions or other job artifacts through this grant.
+  statement {
+    sid     = "ManageManualThumbnails"
+    effect  = "Allow"
+    actions = [
+      "s3:PutObject",
+      "s3:GetObject",
+      "s3:GetObjectTagging",
+      "s3:DeleteObject",
+      "s3:PutObjectTagging",
+    ]
+    resources = [
+      "arn:aws:s3:::${local.bucket_name}/renditions/*/thumbs/manual_*",
+    ]
   }
 }
 
