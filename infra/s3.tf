@@ -86,17 +86,22 @@ data "aws_iam_policy_document" "media_bucket_policy" {
   }
 }
 
-# Bucket CORS for the browser upload (CONTRACT.md section 9): exactly one PUT
-# rule. The presigner signs Content-Type, so the browser only needs
-# content-type as an allowed header; ETag is exposed so the browser can
-# confirm the upload integrity.
+# Bucket CORS for browser uploads (CONTRACT.md sections 1 and 9). The
+# standard video upload signs Content-Type. Manual thumbnail uploads also
+# sign If-None-Match, storage class and object tags; these headers must be
+# allowed by the browser preflight. No checksum header is signed.
 resource "aws_s3_bucket_cors_configuration" "media" {
   bucket = aws_s3_bucket.media.id
 
   cors_rule {
     allowed_methods = ["PUT"]
     allowed_origins = ["*"]
-    allowed_headers = ["content-type"]
+    allowed_headers = [
+      "content-type",
+      "if-none-match",
+      "x-amz-storage-class",
+      "x-amz-tagging",
+    ]
     expose_headers  = ["ETag"]
   }
 }
