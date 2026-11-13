@@ -138,6 +138,13 @@ webhook handler re-reads the sidecar, `SidecarVideoResolver`) and
 Bunny origin key) on a schedule; both secrets are sensitive outputs and must
 live only in Railway secrets / the Bunny dashboard.
 
+Manual thumbnail upload adds only `s3:PutObject`, `s3:GetObject`,
+`s3:GetObjectTagging`, `s3:DeleteObject`, and `s3:PutObjectTagging` on
+`renditions/*/thumbs/manual_*`. Presigned PUTs include the retention tag and
+storage class, and bucket CORS allows those signed headers plus
+`If-None-Match`. The permission does not extend to generated thumbnails or
+other rendition objects.
+
 ## Deferred gates (do NOT claim these ran locally)
 
 No terraform/packer/aws CLI and no real accounts exist in this environment
