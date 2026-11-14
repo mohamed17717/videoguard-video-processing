@@ -142,7 +142,8 @@ The backend returns `upload_url`, `method: "PUT"`, the exact signed `headers`,
 an `upload_token`, and `max_size_bytes` (5 MiB). The browser PUTs the image
 bytes directly to S3 with those headers, then acknowledges it with
 `POST /api/videos/:id/thumbnails/upload-complete` and
-`{ "upload_token": "..." }`. The completion response is the existing Video
+`{ "upload_token": "...", "blur_hash": "..." }` (blur_hash is computed in
+the browser so the control plane never downloads/decodes the image). The completion response is the existing Video
 response with its thumbnail collection refreshed. The backend validates the
 object and token before publishing the thumbnail in the database.
 
