@@ -87,6 +87,7 @@ RUN apt-get update \
         clamav-daemon \
         clamav-freshclam \
         python3-minimal \
+        libpython3-stdlib \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

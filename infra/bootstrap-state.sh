@@ -81,7 +81,8 @@ if aws dynamodb describe-table --table-name "$TABLE" >/dev/null 2>&1; then
 else
     log "creating lock table ${TABLE}"
     aws dynamodb create-table --table-name "$TABLE" \
-        --attribute-name LockID --attribute-type S \
+        --attribute-definitions AttributeName=LockID,AttributeType=S \
+        --key-schema AttributeName=LockID,KeyType=HASH \
         --billing-mode PAY_PER_REQUEST \
         --sse-specification Enabled=true >/dev/null
     aws dynamodb wait table-exists --table-name "$TABLE"
